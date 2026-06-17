@@ -1,0 +1,17 @@
+.{
+    .name = .zjpeg2png,
+    .version = "1.0.0",
+    .fingerprint = 0x7b97eea1a68722bf,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zigimg = .{
+            .url = "git+https://github.com/zigimg/zigimg.git#4cab5a17d4c76584723576fcc11497293c25d092",
+            .hash = "zigimg-0.1.0-8_eo2sywFwArMrr5UlqjhhAMbRtpmC4mL5KbBmjrxFba",
+        },
+        .zli = .{
+            .url = "https://github.com/xcaeser/zli/archive/v5.0.0.tar.gz",
+            .hash = "zli-5.0.0-LeUjptjnAAB7S5QkDi3-4NsGAiA9Zg1P24aQ6rx30Pwk",
+        },
+    },
+    .paths = .{"."},
+}

@@ -1,0 +1,236 @@
+name: Release
+
+on:
+  # Run on every push to main: tests always run; build + release only fire when
+  # build.zig.zon carries a version that doesn't yet have a matching tag (see the
+  # check-tag job). No tag push is needed — the release job creates the tag.
+  push:
+    branches:
+      - main
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+# Least privilege: read-only by default; only the release job is elevated.
+permissions:
+  contents: read
+
+# Serialize runs that target the same ref so a re-run never races with an
+# in-flight `gh release` publish. Never cancel a publish mid-upload.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Make every `run:` block use bash with `-e -o pipefail` (catches mid-pipeline
+# failures, not just the last command).
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Gate the whole release on the bit-exactness suite — the project's core
+  # guarantee. Runs natively on x86_64 so the integration tests can execute the
+  # binaries they build (cross-compiled targets can't self-test on this runner,
+  # but the numeric kernels are target-independent, so the native run suffices).
+  # This is the only job that runs on every commit / PR.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+      - name: Run test suite (ReleaseFast — the normal invocation)
+        run: zig build test -Doptimize=ReleaseFast
+
+  # build.zig.zon is the single source of truth for the version. Read it, then
+  # ask GitHub whether a `v<version>` tag already exists. exists == 'false' means
+  # the version was bumped since the last release ⇒ build + publish. Otherwise
+  # the downstream jobs are skipped and this push just ran the tests above.
+  # Skipped on pull_request: PRs (incl. forks) must not build/release.
+  check-tag:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      exists: ${{ steps.check-tag.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read version from build.zig.zon
+        id: ver
+        run: |
+          version=$(grep -oP '\.version\s*=\s*"\K[^"]+' build.zig.zon)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version: $version"
+
+      - uses: mukunku/tag-exists-action@v1.7.0
+        id: check-tag
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tag: v${{ steps.ver.outputs.version }}
+
+  build:
+    needs:
+      - test
+      - check-tag
+    if: needs.check-tag.outputs.exists == 'false'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 ships in two flavors: -avx2 (x86_64_v3, Haswell+) and a
+          # baseline that runs on any x86_64 (the @Vector kernels lower to SSE2).
+          - { runner: ubuntu-latest, target: x86_64-linux,       cpu: x86_64_v3, suffix: linux-x86_64-avx2,   ext: tar.gz }
+          - { runner: ubuntu-latest, target: x86_64-linux,       cpu: "",        suffix: linux-x86_64,        ext: tar.gz }
+          - { runner: ubuntu-latest, target: aarch64-linux,      cpu: "",        suffix: linux-aarch64,       ext: tar.gz }
+          - { runner: ubuntu-latest, target: x86_64-windows-gnu, cpu: x86_64_v3, suffix: windows-x86_64-avx2, ext: zip }
+          - { runner: ubuntu-latest, target: x86_64-windows-gnu, cpu: "",        suffix: windows-x86_64,      ext: zip }
+          - { runner: ubuntu-latest, target: aarch64-macos,      cpu: "",        suffix: macos-aarch64,       ext: tar.gz }
+          - { runner: ubuntu-latest, target: x86_64-macos,       cpu: "",        suffix: macos-x86_64,        ext: tar.gz }
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      # Matrix values go through env (never interpolated into the script text)
+      # to avoid quoting surprises. strip + version are handled by build.zig.
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+          CPU: ${{ matrix.cpu }}
+        run: |
+          flags=(-Doptimize=ReleaseFast "-Dtarget=$TARGET")
+          if [ -n "$CPU" ]; then
+            flags+=("-Dcpu=$CPU")
+          fi
+          echo "+ zig build ${flags[*]}"
+          zig build "${flags[@]}"
+
+      # x86_64-linux is the only target runnable on the runner: exercise the real
+      # decode path (this hits the AVX2 kernels for the -avx2 build) and confirm
+      # the injected version prints.
+      - name: Smoke test (native-runnable target only)
+        if: matrix.target == 'x86_64-linux'
+        run: |
+          ./zig-out/bin/zjpeg2png version
+          ./zig-out/bin/zjpeg2png tests/image.jpg -i 1 -q -o /tmp/smoke.png
+          test -s /tmp/smoke.png
+
+      - name: Package
+        env:
+          VER: ${{ needs.check-tag.outputs.version }}
+          SUFFIX: ${{ matrix.suffix }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          PKG="zjpeg2png-$VER-$SUFFIX"
+          mkdir -p "dist/$PKG"
+          # Bundle LICENSE + README so the GPLv3 binary is conveyed with its
+          # license terms; a single top-level dir avoids a tarbomb.
+          cp LICENSE README.md "dist/$PKG/"
+          if [ "$EXT" = "zip" ]; then
+            cp zig-out/bin/zjpeg2png.exe "dist/$PKG/"
+            (cd dist && zip -9 -r "$PKG.zip" "$PKG")
+          else
+            cp zig-out/bin/zjpeg2png "dist/$PKG/"
+            chmod +x "dist/$PKG/zjpeg2png"
+            tar -C dist -czf "dist/$PKG.tar.gz" "$PKG"
+          fi
+          ls -l dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: zjpeg2png-${{ matrix.suffix }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    needs:
+      - build
+      - check-tag
+    runs-on: ubuntu-latest
+    if: needs.check-tag.outputs.exists == 'false'
+    permissions:
+      contents: write
+    steps:
+      # Only the release-notes file is needed here; sparse-checkout avoids
+      # pulling the whole tree just to read it.
+      - name: Check out release notes
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/release.md
+          sparse-checkout-cone-mode: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum zjpeg2png-*.tar.gz zjpeg2png-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: v${{ needs.check-tag.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ls dist/zjpeg2png-* >/dev/null   # fail loudly if nothing was downloaded
+
+          # SemVer prerelease tags carry a hyphen (e.g. v1.2.3-rc1).
+          PRE=()
+          case "$TAG" in
+            *-*) PRE=(--prerelease) ;;
+          esac
+
+          # Release notes live in .github/release.md (checked out above);
+          # --generate-notes appends the auto-generated changelog after it.
+          # gh release view exits 0 iff the release already exists, so create
+          # runs only on the first time this version is published and any real
+          # auth/API error propagates instead of being masked by a blind upload.
+          # On create, gh makes the tag itself (at this commit) — there is no
+          # pushed tag to verify, so --target replaces the old --verify-tag.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/zjpeg2png-* dist/SHA256SUMS --clobber --repo "$REPO"
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TAG" \
+              --target "$SHA" \
+              --generate-notes \
+              --notes-file .github/release.md \
+              "${PRE[@]}" \
+              dist/zjpeg2png-* dist/SHA256SUMS
+          fi
